@@ -78,13 +78,13 @@ pub mod tests {
 
             let dir = tempfile::tempdir().unwrap();
 
-            let storage = da_storage::Storage::new_local(dir.path()).unwrap();
+            let storage = dredge::Storage::new_local(dir.path()).unwrap();
             let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
             let listener = TcpListener::bind(addr).await.unwrap();
             let storage_addr = listener.local_addr().unwrap();
 
             let storage_server = tokio::spawn(async move {
-                da_storage::serve_http(listener, storage).await.unwrap();
+                dredge::serve_http(listener, storage).await.unwrap();
             });
 
             let dir = tempfile::tempdir().unwrap();
