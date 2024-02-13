@@ -1,0 +1,40 @@
+[package]
+name = "sentinel"
+
+version.workspace = true
+edition.workspace = true
+
+[dev-dependencies]
+tempfile = "3.6"
+da-storage = { path = "../da-storage" }
+
+[build-dependencies]
+ethers.workspace = true
+eyre = "0.6"
+
+[dependencies]
+tokio.workspace = true
+eyre.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+ethers.workspace = true
+prometheus-client.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+
+anvil-rpc = { git = "https://github.com/foundry-rs/foundry" }
+rocksdb = { version = "0.21.0", default-features = false }
+serde_repr = "0.1"
+async-trait = "0.1"
+rkyv = { version = "0.7.44", features = ["validation"] }
+url = { version = "2.4", default-features = false }
+axum = "0.7.4"
+futures = "0.3"
+tower-http = { version = "0.5.1", features = ["trace"] }
+tower = "0.4.13"
+
