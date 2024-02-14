@@ -27,7 +27,7 @@ type DacMiddleware<P> = SignerMiddleware<Provider<P>, LocalWallet>;
 
 pub type Dac<P> = DataAvailabilityChallenge<DacMiddleware<P>>;
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum ChallengeStatus {
     Uninitialized,
     Active,
@@ -119,7 +119,7 @@ impl std::fmt::Debug for ResolveJob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}:{} x{}",
+            "{}:{} retries: {}",
             hex::encode(&self.hash),
             self.block_number,
             self.retries
@@ -267,20 +267,23 @@ impl ChallengeManager {
                     }
                     Some(tx) = pending_txs.next() => {
                         let job = pending_resolves.pop_front().expect("pending resolves is empty");
-                        if let Err(e) = &tx {
-                            tracing::error!("ChallengeManager::run: failed to resolve challenge for {:?}: {}", job, e);
-                            job.maybe_retry(sender.clone()).await;
-                        }
-                        if let Ok(Some(_)) = tx {
-                            tracing::debug!("ChallengeManager::run: challenge resolved ({:?})", job);
-                        } else {
-                            if let Ok(init_nonce) = provider
-                                .get_transaction_count(provider.address(), None)
-                                .await {
-                                    nonce = init_nonce.as_u64();
+                        match &tx {
+                            Ok(Some(_)) => {
+                                tracing::debug!("ChallengeManager::run: challenge resolved ({:?})", job);
                             }
-                            tracing::debug!("ChallengeManager::run: receipt not found for challenge {:?}, reinit nonce to {}", job, nonce);
-                            job.maybe_retry(sender.clone()).await;
+                            Ok(None) => {
+                                if let Ok(init_nonce) = provider
+                                    .get_transaction_count(provider.address(), None)
+                                    .await {
+                                        nonce = init_nonce.as_u64();
+                                }
+                                tracing::debug!("ChallengeManager::run: receipt not found for challenge {:?}, reinit nonce to {}", job, nonce);
+                                job.maybe_retry(sender.clone()).await;
+                            }
+                            Err(e) => {
+                                tracing::error!("ChallengeManager::run: failed to resolve challenge for {:?}: {}", job, e);
+                                job.maybe_retry(sender.clone()).await;
+                            }
                         }
                     }
                     else => {
@@ -392,12 +395,14 @@ impl ChallengeManager {
                 for log in receipt.logs {
                     let raw = RawLog::from(log);
                     if let Ok(event) = ChallengeStatusChangedFilter::decode_log(&raw) {
-                        if event.status == 1 {
-                            tracing::debug!("Queing resolve job");
+                        let status = ChallengeStatus::try_from(event.status)?;
+                        self.record_challenge_status(status);
+                        if matches!(status, ChallengeStatus::Active) {
                             let job = ResolveJob::new(
                                 event.challenged_block_number.as_u64(),
                                 event.challenged_hash,
                             );
+                            tracing::debug!("Queing resolve job: {:?}", job);
                             self.jobs.send(job).await?;
                         }
                     }

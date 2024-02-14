@@ -7,11 +7,6 @@ use prometheus_client::registry::Registry;
 pub struct Metrics {
     active_challenges: Gauge,
     challenge_events: Family<ChallengeEventLabels, Counter>,
-    subjective_safe_head: Gauge,
-    safe_head: Gauge,
-    latest_input_block: Gauge,
-    total_commitments_stored: Counter,
-    total_input_storage: Counter,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -41,45 +36,9 @@ impl Metrics {
             active_challenges.clone(),
         );
 
-        let subjective_safe_head = Gauge::default();
-        registry.register(
-            "subjective_safe_head",
-            "Latest subjective safe head recorded",
-            subjective_safe_head.clone(),
-        );
-
-        let safe_head = Gauge::default();
-        registry.register("safe_head", "Latest safe head recorded", safe_head.clone());
-
-        let latest_input_block = Gauge::default();
-        registry.register(
-            "latest_input_block",
-            "Latest block at which a commitment was stored",
-            latest_input_block.clone(),
-        );
-
-        let total_commitments_stored = Counter::default();
-        registry.register(
-            "total_commitments_stored",
-            "Total number of commitments stored",
-            total_commitments_stored.clone(),
-        );
-
-        let total_input_storage = Counter::default();
-        registry.register(
-            "total_input_storage",
-            "Total number of input bytes stored",
-            total_input_storage.clone(),
-        );
-
         Self {
             active_challenges,
             challenge_events,
-            subjective_safe_head,
-            safe_head,
-            latest_input_block,
-            total_commitments_stored,
-            total_input_storage,
         }
     }
 
@@ -103,22 +62,5 @@ impl Metrics {
                 event: ChallengeEventType::Expired,
             })
             .inc();
-    }
-
-    pub fn set_subjective_safe_head(&self, block: u64) {
-        self.subjective_safe_head.set(block as i64);
-    }
-
-    pub fn set_safe_head(&self, block: u64) {
-        self.safe_head.set(block as i64);
-    }
-
-    pub fn set_latest_input_block(&self, block: u64) {
-        self.latest_input_block.set(block as i64);
-    }
-
-    pub fn record_commitment_stored(&self, size: usize) {
-        self.total_commitments_stored.inc();
-        self.total_input_storage.inc_by(size as u64);
     }
 }
