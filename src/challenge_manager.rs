@@ -12,7 +12,7 @@ use ethers::middleware::{MiddlewareError, SignerMiddleware};
 use ethers::providers::StreamExt;
 use ethers::providers::{Http, Middleware, PendingTransaction, Provider};
 use ethers::signers::LocalWallet;
-use ethers::types::{Block, Bytes, H256, U256};
+use ethers::types::{Block, Bytes, TransactionReceipt, H256, U256};
 use ethers::utils::hex;
 use futures::stream::FuturesOrdered;
 use std::collections::VecDeque;
@@ -361,12 +361,24 @@ impl ChallengeManager {
         }
     }
 
-    pub async fn load_block(&self, block: Block<H256>) -> eyre::Result<()> {
+    async fn get_block_receipts(
+        &self,
+        block: Block<H256>,
+    ) -> eyre::Result<Vec<TransactionReceipt>> {
         let provider = self.contract.client();
-        let num = block
-            .number
-            .ok_or_else(|| eyre::eyre!("Block number not found"))?;
-        let receipts = provider.get_block_receipts(num).await?;
+        let mut receipts = Vec::new();
+        for tx in block.transactions {
+            let receipt = provider
+                .get_transaction_receipt(tx)
+                .await?
+                .ok_or_else(|| eyre::eyre!("Transaction receipt not found"))?;
+            receipts.push(receipt);
+        }
+        Ok(receipts)
+    }
+
+    pub async fn load_block(&self, block: Block<H256>) -> eyre::Result<()> {
+        let receipts = self.get_block_receipts(block).await?;
 
         for receipt in receipts {
             if receipt.status == Some(1.into())

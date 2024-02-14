@@ -157,42 +157,46 @@ impl Sentinel {
                 };
 
             loop {
-                if let Ok(wsp) = Provider::<Ws>::connect(&self.l1_rpc_ws).await {
-                    if let Ok(mut stream) = wsp.subscribe_blocks().await {
-                        loop {
-                            tokio::select! {
-                                conn = listener.accept() => {
-                                    match conn {
-                                        Ok((socket, _)) => {
-                                            handle_conn(socket, svc.clone());
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("failed to accept connection: {}", e);
-                                        }
-                                    }
-                                }
-                                block = stream.next() => {
-                                    if let Some(block) = block {
-                                        let num = block.number;
-                                        match challenges.load_block(block).await {
-                                            Ok(_) => {
-                                                tracing::info!("loaded block {:?}", num);
+                match Provider::<Ws>::connect(&self.l1_rpc_ws).await {
+                    Ok(wsp) => {
+                        if let Ok(mut stream) = wsp.subscribe_blocks().await {
+                            loop {
+                                tokio::select! {
+                                    conn = listener.accept() => {
+                                        match conn {
+                                            Ok((socket, _)) => {
+                                                handle_conn(socket, svc.clone());
                                             }
                                             Err(e) => {
-                                                tracing::error!("failed to load block: {}", e);
+                                                tracing::error!("failed to accept connection: {}", e);
                                             }
                                         }
                                     }
-                                }
-                                _ = sigterm.recv() => {
-                                    tracing::info!("received SIGTERM, shutting down");
-                                }
+                                    block = stream.next() => {
+                                        if let Some(block) = block {
+                                            let num = block.number;
+                                            match challenges.load_block(block).await {
+                                                Ok(_) => {
+                                                    tracing::info!("loaded block {:?}", num);
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!("failed to load block: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ = sigterm.recv() => {
+                                        tracing::info!("received SIGTERM, shutting down");
+                                    }
 
+                                }
                             }
                         }
                     }
+                    Err(e) => {
+                        tracing::error!("failed to connect to l1 ws: {:?}", e);
+                    }
                 }
-                tracing::error!("failed to connect to l1 ws");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
