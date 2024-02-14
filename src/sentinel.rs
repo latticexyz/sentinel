@@ -175,9 +175,17 @@ impl Sentinel {
                                     block = stream.next() => {
                                         if let Some(block) = block {
                                             let num = block.number;
-                                            match challenges.load_block(block).await {
+                                            let hash = match block.hash {
+                                                Some(hash) => hash,
+                                                None => {
+                                                    // should never happen but just in case
+                                                    tracing::error!("block missing hash: {:?}", block);
+                                                    continue;
+                                                }
+                                            };
+                                            match challenges.load_block(hash).await {
                                                 Ok(_) => {
-                                                    tracing::info!("loaded block {:?}", num);
+                                                    tracing::info!("loaded block {:?}, {:?}", num, hash);
                                                 }
                                                 Err(e) => {
                                                     tracing::error!("failed to load block: {}", e);

@@ -12,7 +12,7 @@ use ethers::middleware::{MiddlewareError, SignerMiddleware};
 use ethers::providers::StreamExt;
 use ethers::providers::{Http, Middleware, PendingTransaction, Provider};
 use ethers::signers::LocalWallet;
-use ethers::types::{Block, Bytes, TransactionReceipt, H256, U256};
+use ethers::types::{Bytes, TransactionReceipt, H256, U256};
 use ethers::utils::hex;
 use futures::stream::FuturesOrdered;
 use std::collections::VecDeque;
@@ -361,11 +361,12 @@ impl ChallengeManager {
         }
     }
 
-    async fn get_block_receipts(
-        &self,
-        block: Block<H256>,
-    ) -> eyre::Result<Vec<TransactionReceipt>> {
+    async fn get_block_receipts(&self, block: H256) -> eyre::Result<Vec<TransactionReceipt>> {
         let provider = self.contract.client();
+        let block = provider
+            .get_block(block)
+            .await?
+            .ok_or_else(|| eyre::eyre!("Block not found: {:?}", block))?;
         let mut receipts = Vec::new();
         for tx in block.transactions {
             let receipt = provider
@@ -377,7 +378,7 @@ impl ChallengeManager {
         Ok(receipts)
     }
 
-    pub async fn load_block(&self, block: Block<H256>) -> eyre::Result<()> {
+    pub async fn load_block(&self, block: H256) -> eyre::Result<()> {
         let receipts = self.get_block_receipts(block).await?;
 
         for receipt in receipts {
@@ -387,10 +388,12 @@ impl ChallengeManager {
                     .map(|to| to == self.contract.address())
                     .unwrap_or(false)
             {
+                tracing::debug!("Found new challenge tx receipt");
                 for log in receipt.logs {
                     let raw = RawLog::from(log);
                     if let Ok(event) = ChallengeStatusChangedFilter::decode_log(&raw) {
                         if event.status == 1 {
+                            tracing::debug!("Queing resolve job");
                             let job = ResolveJob::new(
                                 event.challenged_block_number.as_u64(),
                                 event.challenged_hash,
@@ -416,6 +419,8 @@ impl ChallengeManager {
         if latest > lookback {
             start = latest - lookback;
         }
+
+        tracing::info!("Backfilling challenges from block {} to {}", start, latest);
 
         for i in start.. {
             if let Some(block) = provider.get_block_with_txs(i).await? {
@@ -642,7 +647,7 @@ pub mod tests {
         while let Some(block) = stream.next().await {
             println!("{:?}", block.hash);
 
-            challenge_manager.load_block(block).await?;
+            challenge_manager.load_block(block.hash.unwrap()).await?;
         }
 
         harness.verify_resolved().await?;
