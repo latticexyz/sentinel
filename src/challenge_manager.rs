@@ -55,7 +55,11 @@ pub async fn resolve_challenge(
     key: [u8; 32],
     data: Bytes,
 ) -> eyre::Result<()> {
-    match contract.resolve(at.into(), key, data.into()).send().await {
+    match contract
+        .resolve(at.into(), key.into(), data.into())
+        .send()
+        .await
+    {
         Ok(tx) => match tx
             .confirmations(6)
             .retries(5)
@@ -86,18 +90,18 @@ pub async fn resolve_challenge(
 // Set a max number of retries so we're not vulnerable to a DoS attack.
 const MAX_RETRIES: usize = 12;
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 struct ResolveJob {
     block_number: u64,
-    hash: [u8; 32],
+    comm: Bytes,
     retries: usize,
 }
 
 impl ResolveJob {
-    fn new(block_number: u64, hash: [u8; 32]) -> ResolveJob {
+    fn new(block_number: u64, comm: Bytes) -> ResolveJob {
         ResolveJob {
             block_number,
-            hash,
+            comm,
             retries: 0,
         }
     }
@@ -120,7 +124,7 @@ impl std::fmt::Debug for ResolveJob {
         write!(
             f,
             "{}:{} retries: {}",
-            hex::encode(&self.hash),
+            hex::encode(&self.comm),
             self.block_number,
             self.retries
         )
@@ -135,8 +139,11 @@ async fn handle_resolve_challenge(
 ) -> eyre::Result<Option<H256>> {
     tracing::debug!("handling new challenge {:?}", job);
     let bn = job.block_number;
-    let key = job.hash;
-    let status = contract.get_challenge_status(bn.into(), key).call().await?;
+    let key = job.comm.clone();
+    let status = contract
+        .get_challenge_status(bn.into(), key.clone())
+        .call()
+        .await?;
     let status =
         ChallengeStatus::try_from(status).unwrap_or_else(|_| ChallengeStatus::Uninitialized);
 
@@ -146,7 +153,7 @@ async fn handle_resolve_challenge(
     }
     tracing::debug!("challenge still active ({:?}), looking up data...", status);
 
-    match storage.get(&job.hash).await {
+    match storage.get(key.clone()).await {
         Ok(Some(data)) => {
             let call = contract.resolve(bn.into(), key, data.into()).nonce(nonce);
             tracing::debug!(
@@ -225,7 +232,7 @@ impl ChallengeManager {
                     Some(job) = rx.recv() => {
                         let tx_nonce = nonce;
                         nonce += 1;
-                        match handle_resolve_challenge(tx_nonce.into(), job, dac.clone(), storage.clone()).await {
+                        match handle_resolve_challenge(tx_nonce.into(), job.clone(), dac.clone(), storage.clone()).await {
                             Ok(tx_hash) => {
                                 if let Some(tx_hash) = tx_hash {
                                     let pending_tx = PendingTransaction::new(tx_hash, provider.provider())
@@ -323,19 +330,21 @@ impl ChallengeManager {
 
     pub async fn challenge(&self, hash: [u8; 32], bn: u64) -> eyre::Result<()> {
         self.load_bond().await?;
-        self.contract.challenge(bn.into(), hash).send().await?;
+        self.contract
+            .challenge(bn.into(), hash.into())
+            .send()
+            .await?;
         Ok(())
     }
 
-    pub async fn query_resolved_input(&self, hash: [u8; 32]) -> eyre::Result<Bytes> {
-        let mut event = self
+    pub async fn query_resolved_input(&self, comm: Bytes) -> eyre::Result<Bytes> {
+        let event = self
             .contract
             .challenge_status_changed_filter()
             .from_block(0);
-        event.filter = event.filter.topic1(H256::from(hash));
         let logs = event.query_with_meta().await?;
         for (log, meta) in logs {
-            if log.challenged_hash != hash {
+            if log.challenged_commitment != comm {
                 tracing::error!("Event filter returned wrong event");
                 continue;
             }
@@ -347,7 +356,7 @@ impl ChallengeManager {
                     .await?
                     .ok_or_else(|| eyre::eyre!("Transaction not found"))?;
                 let call = ResolveCall::decode(tx.input.as_ref())?;
-                return Ok(call.pre_image);
+                return Ok(call.resolve_data);
             }
         }
         Err(eyre::eyre!("No resolved input found"))
@@ -400,7 +409,7 @@ impl ChallengeManager {
                         if matches!(status, ChallengeStatus::Active) {
                             let job = ResolveJob::new(
                                 event.challenged_block_number.as_u64(),
-                                event.challenged_hash,
+                                event.challenged_commitment,
                             );
                             tracing::debug!("Queing resolve job: {:?}", job);
                             self.jobs.send(job).await?;
@@ -433,11 +442,12 @@ impl ChallengeManager {
                     if tx.to == Some(self.config.batch_inbox_address)
                         && tx.from == self.system_config.batcher_addr
                     {
-                        let data: [u8; 32] = tx.input[..].try_into()?;
-
-                        let status = self.contract.get_challenge_status(i.into(), data).await?;
+                        let status = self
+                            .contract
+                            .get_challenge_status(i.into(), tx.input.clone())
+                            .await?;
                         if status == 1 {
-                            let job = ResolveJob::new(i, data);
+                            let job = ResolveJob::new(i, tx.input);
                             self.jobs.send(job).await?;
                         }
                     }
@@ -457,6 +467,7 @@ pub mod tests {
     use crate::storage_client::tests::StorageHarness;
     use ethers::core::utils::{Anvil, AnvilInstance};
     use ethers::prelude::*;
+    use ethers::signers::{coins_bip39::English, MnemonicBuilder};
     use ethers::utils::hex;
     use std::sync::Arc;
     use std::time::Duration;
@@ -468,14 +479,21 @@ pub mod tests {
         pub storage: StorageHarness,
         pub provider: Arc<SignerMiddleware<Provider<Http>, LocalWallet>>,
         pub config: Config,
-        pub commitments: Vec<(u64, [u8; 32])>,
+        pub commitments: Vec<(u64, Bytes)>,
     }
 
     impl DacHarness {
         pub async fn start() -> eyre::Result<Self> {
             let storage = StorageHarness::start().await?;
-            let anvil = Anvil::new().spawn();
-            let wallet: LocalWallet = anvil.keys()[0].clone().into();
+            let anvil = Anvil::new()
+                .arg("--init")
+                .arg("l1-genesis.json")
+                .arg("--chain-id")
+                .arg("900")
+                .spawn();
+            let wallet = MnemonicBuilder::<English>::default()
+                .phrase("test test test test test test test test test test test junk")
+                .build()?;
 
             let user_address = wallet.address();
 
@@ -486,30 +504,20 @@ pub mod tests {
             );
             let mut provider = Provider::<Http>::try_from(anvil.endpoint())?;
             provider.set_interval(Duration::from_millis(100));
-            let provider =
-                Arc::new(provider.with_signer(wallet.clone().with_chain_id(anvil.chain_id())));
+            let provider = Arc::new(provider.with_signer(wallet.clone().with_chain_id(900u64)));
 
-            let dac = DataAvailabilityChallenge::deploy(provider.clone(), ())?
-                .send()
-                .await?;
-            let addr = dac.address();
+            let proxy_address: Address = "0x978e3286EB805934215a88694d80b09aDed68D90".parse()?;
 
-            println!("Deployed contract at {}", addr);
+            let dac = DataAvailabilityChallenge::new(proxy_address, provider.clone());
 
-            dac.initialize(
-                user_address,
-                U256::from(20),
-                U256::from(70),
-                U256::from(1000),
-            )
-            .send()
-            .await?
-            .await?;
+            println!("Init contract at {:?}", dac.address());
 
             let config = Config::default()
                 .with_challenge_contract(dac.address())
-                .with_batch_inbox("0xff00000000000000000000000000000000000123".parse()?)
+                .with_batch_inbox("0xff00000000000000000000000000000000000901".parse()?)
                 .with_batcher_addr(user_address);
+
+            println!("{:?}", config);
 
             Ok(Self {
                 dac,
@@ -525,32 +533,40 @@ pub mod tests {
             // load up a different wallet for the challenger
             let challenger = LocalWallet::new(&mut ethers::core::rand::thread_rng());
 
+            // print the balance of the provider
+            let balance = self
+                .provider
+                .get_balance(self.provider.address(), None)
+                .await?;
+            println!("Balance: {}", balance);
+
             let tx = TransactionRequest::new()
                 .to(challenger.address())
-                .value(ethers::utils::parse_units("1", "ether")?);
+                .value(ethers::utils::parse_units("1000", "ether")?);
 
             self.provider.send_transaction(tx, None).await?.await?;
 
             let mut provider = Provider::<Http>::try_from(self.anvil.endpoint())?;
             provider.set_interval(Duration::from_millis(100));
-            let provider = Arc::new(
-                provider.with_signer(challenger.clone().with_chain_id(self.anvil.chain_id())),
-            );
+            let provider = Arc::new(provider.with_signer(challenger.clone().with_chain_id(900u64)));
 
             let dac = DataAvailabilityChallenge::new(self.dac.address(), provider.clone());
             Ok(dac)
         }
 
-        pub async fn step(&mut self) -> eyre::Result<(Block<H256>, [u8; 32])> {
+        pub async fn step(&mut self) -> eyre::Result<(Block<H256>, Bytes)> {
             // simulate batcher tx
             let (comm, _) = self.storage.put_random_input().await?;
             let tx = TransactionRequest::new()
                 .to(self.config.batch_inbox_address)
-                .data(comm);
-            let tx = self.provider.send_transaction(tx, None).await?;
-            println!("published tx: {:?} ", tx);
-            // let receipt = tx.await?;
-            // println!("included tx {:?}", receipt);
+                .data(comm.clone());
+            let tx = self
+                .provider
+                .send_transaction(tx, None)
+                .await?
+                .confirmations(1);
+            let receipt = tx.await?;
+            println!("included tx {:?}", receipt);
             let block = self
                 .provider
                 .get_block(BlockNumber::Latest)
@@ -563,12 +579,12 @@ pub mod tests {
                 .await?;
 
             self.commitments
-                .push((block.number.unwrap().as_u64(), comm));
+                .push((block.number.unwrap().as_u64(), comm.clone()));
 
             Ok((block, comm))
         }
 
-        pub async fn new_challenge(&self, bn: u64, hash: [u8; 32]) -> eyre::Result<u64> {
+        pub async fn new_challenge(&self, bn: u64, comm: Bytes) -> eyre::Result<u64> {
             let bond_size = self.dac.bond_size().await?;
             let mut deposit = self.dac.deposit();
 
@@ -576,7 +592,7 @@ pub mod tests {
 
             let _ = deposit.send().await?;
 
-            if let Err(e) = self.dac.challenge(bn.into(), hash).send().await {
+            if let Err(e) = self.dac.challenge(bn.into(), comm.clone()).send().await {
                 if let ContractError::Revert(bytes) = e {
                     if let Ok(err) = DataAvailabilityChallengeErrors::decode(bytes) {
                         eyre::bail!("Challenge contract error: {:?}", err);
@@ -585,7 +601,7 @@ pub mod tests {
             }
             println!(
                 "challenged commitment {} at block {}",
-                hex::encode(hash),
+                hex::encode(&comm),
                 bn
             );
 
@@ -595,16 +611,16 @@ pub mod tests {
         }
 
         pub async fn verify_resolved(&self) -> eyre::Result<()> {
-            for (bn, hash) in &self.commitments {
+            for (bn, comm) in &self.commitments {
                 let status = self
                     .dac
-                    .get_challenge_status((*bn).into(), *hash)
+                    .get_challenge_status((*bn).into(), comm.clone())
                     .call()
                     .await?;
                 if status != 2 {
                     eyre::bail!(
                         "commitment {} at block {} not resolved",
-                        hex::encode(hash),
+                        hex::encode(&comm),
                         bn
                     );
                 }
@@ -615,14 +631,6 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_auto_resolve() -> eyre::Result<()> {
-        // tracing_subscriber::registry()
-        //     .with(
-        //         tracing_subscriber::EnvFilter::try_from_default_env()
-        //             .unwrap_or_else(|_| "rpc=warn,da_service=debug".into()),
-        //     )
-        //     .with(tracing_subscriber::fmt::layer())
-        //     .init();
-
         println!(
             "Generated challenge contract bindings at {}/contract_bindings.rs",
             env!("OUT_DIR")
@@ -662,6 +670,14 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_backfill() -> eyre::Result<()> {
+        // tracing_subscriber::registry()
+        //     .with(
+        //         tracing_subscriber::EnvFilter::try_from_default_env()
+        //             .unwrap_or_else(|_| "rpc=warn,sentinel=debug".into()),
+        //     )
+        //     .with(tracing_subscriber::fmt::layer())
+        //     .init();
+
         let mut harness = DacHarness::start().await?;
 
         let challenge_manager = ChallengeManager::new(

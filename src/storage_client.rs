@@ -20,8 +20,8 @@ impl StorageClient {
         }
     }
 
-    pub async fn put(&self, key: &[u8; 32], value: Bytes) -> eyre::Result<()> {
-        self.store.put_preimage(key, &value)?;
+    pub async fn put(&self, key: Bytes, value: Bytes) -> eyre::Result<()> {
+        self.store.put_preimage(&key, &value)?;
 
         let key = format!("0x{}", hex::encode(key));
         if let Some(uri) = self.storage_uri.as_ref() {
@@ -34,8 +34,8 @@ impl StorageClient {
         Ok(())
     }
 
-    pub async fn get(&self, key: &[u8; 32]) -> eyre::Result<Option<Bytes>> {
-        if let Ok(data) = self.store.get_preimage(key) {
+    pub async fn get(&self, key: Bytes) -> eyre::Result<Option<Bytes>> {
+        if let Ok(data) = self.store.get_preimage(&key) {
             return Ok(Some(data.into()));
         }
         if let Some(uri) = self.storage_uri.as_ref() {
@@ -101,17 +101,20 @@ pub mod tests {
             })
         }
 
-        pub fn random_input(&self) -> ([u8; 32], Bytes) {
+        pub fn random_input(&self) -> (Bytes, Bytes) {
             let mut data = vec![0u8; 100];
             rand::thread_rng().fill_bytes(&mut data);
             let hash = keccak256(&data);
 
-            (hash, bytes::Bytes::from(data).into())
+            let mut key = vec![0];
+            key.extend_from_slice(&hash);
+
+            (key.into(), data.into())
         }
 
-        pub async fn put_random_input(&self) -> eyre::Result<([u8; 32], Bytes)> {
+        pub async fn put_random_input(&self) -> eyre::Result<(Bytes, Bytes)> {
             let (key, data) = self.random_input();
-            self.client.put(&key, data.clone()).await?;
+            self.client.put(key.clone(), data.clone()).await?;
             Ok((key, data))
         }
 
@@ -129,18 +132,18 @@ pub mod tests {
 
         let (key, data) = sh.put_random_input().await?;
 
-        let result = sh.client.get(&key).await?;
+        let result = sh.client.get(key.clone()).await?;
 
         assert_eq!(Some(data.clone()), result);
 
         let new_client = sh.new_client();
 
-        let result = new_client.get(&key).await?;
+        let result = new_client.get(key).await?;
 
         assert_eq!(Some(data.clone()), result);
 
         let (new_key, _) = sh.random_input();
-        let result = new_client.get(&new_key).await?;
+        let result = new_client.get(new_key).await?;
 
         assert_eq!(None, result);
 
