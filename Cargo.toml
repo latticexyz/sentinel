@@ -31,7 +31,6 @@ axum.workspace = true
 anvil-rpc = { git = "https://github.com/foundry-rs/foundry" }
 rocksdb = { version = "0.21.0", default-features = false }
 serde_repr = "0.1"
-async-trait = "0.1"
 rkyv = { version = "0.7.44", features = ["validation"] }
 url = { version = "2.4", default-features = false }
 futures = "0.3"
