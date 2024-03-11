@@ -579,9 +579,9 @@ pub mod tests {
                 .await?;
 
             self.commitments
-                .push((block.number.unwrap().as_u64(), comm.clone()));
+                .push((block.number.unwrap().as_u64(), comm.clone().into()));
 
-            Ok((block, comm))
+            Ok((block, comm.into()))
         }
 
         pub async fn new_challenge(&self, bn: u64, comm: Bytes) -> eyre::Result<u64> {
