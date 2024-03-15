@@ -12,7 +12,7 @@ use ethers::middleware::{MiddlewareError, SignerMiddleware};
 use ethers::providers::StreamExt;
 use ethers::providers::{Http, Middleware, PendingTransaction, Provider};
 use ethers::signers::LocalWallet;
-use ethers::types::{Bytes, TransactionReceipt, H256, U256};
+use ethers::types::{Bytes, Transaction, TransactionReceipt, H256, U256};
 use ethers::utils::hex;
 use futures::stream::FuturesOrdered;
 use std::collections::VecDeque;
@@ -91,21 +91,29 @@ pub async fn resolve_challenge(
 const MAX_RETRIES: usize = 12;
 
 #[derive(Clone)]
-struct ResolveJob {
+struct Job {
     block_number: u64,
     comm: Bytes,
     retries: usize,
+    job_type: JobType,
 }
 
-impl ResolveJob {
-    fn new(block_number: u64, comm: Bytes) -> ResolveJob {
-        ResolveJob {
+#[derive(Clone, Debug)]
+enum JobType {
+    Challenge,
+    Resolve,
+}
+
+impl Job {
+    fn new(jt: JobType, block_number: u64, comm: Bytes) -> Job {
+        Job {
             block_number,
             comm,
             retries: 0,
+            job_type: jt,
         }
     }
-    async fn maybe_retry(self, sender: Sender<ResolveJob>) {
+    async fn maybe_retry(self, sender: Sender<Job>) {
         let mut job = self;
         if job.retries > MAX_RETRIES {
             tracing::error!("Max retries reached for resolve job {:?}, dropping...", job);
@@ -117,13 +125,36 @@ impl ResolveJob {
             tracing::error!("Failed to send resolve job: {}", e);
         }
     }
+
+    fn log_error(&self, e: &eyre::Error) {
+        match self.job_type {
+            JobType::Challenge => {
+                tracing::error!("Job: {:?}: Failed to challenge commitment: {:?}", self, e);
+            }
+            JobType::Resolve => {
+                tracing::error!("Job: {:?}: Failed to resolve challenge: {:?}", self, e);
+            }
+        }
+    }
+
+    fn log_success(&self) {
+        match self.job_type {
+            JobType::Challenge => {
+                tracing::info!("Job: {:?}: Successfully challenged commitment", self);
+            }
+            JobType::Resolve => {
+                tracing::info!("Job: {:?}: Successfully resolved challenge", self);
+            }
+        }
+    }
 }
 
-impl std::fmt::Debug for ResolveJob {
+impl std::fmt::Debug for Job {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}:{} retries: {}",
+            "{:?}: {}:{} retries: {}",
+            self.job_type,
             hex::encode(&self.comm),
             self.block_number,
             self.retries
@@ -133,7 +164,7 @@ impl std::fmt::Debug for ResolveJob {
 
 async fn handle_resolve_challenge(
     nonce: U256,
-    job: ResolveJob,
+    job: Job,
     contract: Dac<Http>,
     storage: StorageClient,
 ) -> eyre::Result<Option<H256>> {
@@ -179,6 +210,76 @@ async fn handle_resolve_challenge(
         }
     }
 }
+async fn load_bond(contract: Dac<Http>, nonce: Option<U256>) -> eyre::Result<()> {
+    let bond_size = contract.bond_size().await?;
+
+    let address = contract.client().address();
+
+    let balance = contract.balances(address).call().await?;
+    if balance < bond_size {
+        let mut deposit = contract.deposit();
+
+        deposit.tx.set_value(bond_size - balance);
+
+        if let Some(nonce) = nonce {
+            deposit.tx.set_nonce(nonce);
+        }
+
+        let _receipt = deposit.send().await?.await?;
+    }
+
+    Ok(())
+}
+
+async fn maybe_challenge_commitment(
+    nonce: U256,
+    job: Job,
+    contract: Dac<Http>,
+    storage: StorageClient,
+) -> eyre::Result<Option<H256>> {
+    tracing::debug!("handling new commitment {:?}", job);
+
+    let key = job.comm.clone();
+    let status = contract
+        .get_challenge_status(job.block_number.into(), key.clone())
+        .call()
+        .await?;
+    let status =
+        ChallengeStatus::try_from(status).unwrap_or_else(|_| ChallengeStatus::Uninitialized);
+
+    if matches!(status, ChallengeStatus::Active) {
+        tracing::debug!("challenge already active ({:?})", status);
+        return Ok(None);
+    }
+
+    if let Ok(None) = storage.get(key.clone()).await {
+        tracing::debug!("loading bond");
+        // Data is missing, challenge!
+        load_bond(contract.clone(), Some(nonce)).await?;
+
+        tracing::debug!("loaded bond");
+
+        contract
+            .challenge(job.block_number.into(), key.clone())
+            .nonce(nonce + 1)
+            .send()
+            .await?;
+    }
+
+    return Ok(None);
+}
+
+async fn handle_job(
+    nonce: U256,
+    job: Job,
+    contract: Dac<Http>,
+    storage: StorageClient,
+) -> eyre::Result<Option<H256>> {
+    match job.job_type {
+        JobType::Challenge => maybe_challenge_commitment(nonce, job, contract, storage).await,
+        JobType::Resolve => handle_resolve_challenge(nonce, job, contract, storage).await,
+    }
+}
 
 #[derive(Clone)]
 pub struct ChallengeManager {
@@ -188,7 +289,8 @@ pub struct ChallengeManager {
     storage_client: StorageClient,
     contract: Dac<Http>,
     metrics: Option<Metrics>,
-    jobs: Sender<ResolveJob>,
+    jobs: Sender<Job>,
+    auto_challenge: bool,
 }
 
 impl std::fmt::Debug for ChallengeManager {
@@ -205,7 +307,7 @@ impl ChallengeManager {
         config: Config,
         metrics: Option<Metrics>,
     ) -> Self {
-        let (tx, mut rx) = channel::<ResolveJob>(3200);
+        let (tx, mut rx) = channel::<Job>(3200);
 
         let sender = tx.clone();
 
@@ -231,8 +333,15 @@ impl ChallengeManager {
                 tokio::select! {
                     Some(job) = rx.recv() => {
                         let tx_nonce = nonce;
-                        nonce += 1;
-                        match handle_resolve_challenge(tx_nonce.into(), job.clone(), dac.clone(), storage.clone()).await {
+
+                        // challenging takes 2 transactions
+                        if matches!(job.job_type, JobType::Challenge) {
+                            nonce += 2;
+                        } else {
+                            nonce += 1;
+                        }
+
+                        match handle_job(tx_nonce.into(), job.clone(), dac.clone(), storage.clone()).await {
                             Ok(tx_hash) => {
                                 if let Some(tx_hash) = tx_hash {
                                     let pending_tx = PendingTransaction::new(tx_hash, provider.provider())
@@ -249,7 +358,7 @@ impl ChallengeManager {
                                         if let Ok(err) = DataAvailabilityChallengeErrors::decode(bytes) {
                                             tracing::error!("Challenge contract error: {:?}", err);
                                         }
-                                        tracing::error!("Failed to resolve challenge: {:?}, dropping challenge {:?}", err, job);
+                                        job.log_error(&e);
                                         // Do not retry contract errors, they will always fail
                                         continue;
                                     }
@@ -264,10 +373,8 @@ impl ChallengeManager {
                                             }
                                         }
                                     }
-                                    tracing::error!("Failed to resolve challenge: {:?}", err);
-                                } else {
-                                    tracing::error!("Failed to resolve challenge: {}", e);
                                 }
+                                job.log_error(&e);
                                 job.maybe_retry(sender.clone()).await;
                             }
                         }
@@ -276,7 +383,7 @@ impl ChallengeManager {
                         let job = pending_resolves.pop_front().expect("pending resolves is empty");
                         match &tx {
                             Ok(Some(_)) => {
-                                tracing::debug!("ChallengeManager::run: challenge resolved ({:?})", job);
+                                job.log_success();
                             }
                             Ok(None) => {
                                 if let Ok(init_nonce) = provider
@@ -284,11 +391,11 @@ impl ChallengeManager {
                                     .await {
                                         nonce = init_nonce.as_u64();
                                 }
-                                tracing::debug!("ChallengeManager::run: receipt not found for challenge {:?}, reinit nonce to {}", job, nonce);
+                                tracing::debug!("ChallengeManager::run: receipt not found for job {:?}, reinit nonce to {}", job, nonce);
                                 job.maybe_retry(sender.clone()).await;
                             }
                             Err(e) => {
-                                tracing::error!("ChallengeManager::run: failed to resolve challenge for {:?}: {}", job, e);
+                                job.log_error(&eyre::format_err!("{:?}", e));
                                 job.maybe_retry(sender.clone()).await;
                             }
                         }
@@ -308,33 +415,13 @@ impl ChallengeManager {
             contract,
             metrics,
             jobs: tx,
+            auto_challenge: false,
         }
     }
 
-    pub async fn load_bond(&self) -> eyre::Result<()> {
-        let bond_size = self.contract.bond_size().await?;
-
-        let address = self.contract.client().address();
-
-        let balance = self.contract.balances(address).call().await?;
-        if balance < bond_size {
-            let mut deposit = self.contract.deposit();
-
-            deposit.tx.set_value(bond_size - balance);
-
-            let _receipt = deposit.send().await?.await?;
-        }
-
-        Ok(())
-    }
-
-    pub async fn challenge(&self, hash: [u8; 32], bn: u64) -> eyre::Result<()> {
-        self.load_bond().await?;
-        self.contract
-            .challenge(bn.into(), hash.into())
-            .send()
-            .await?;
-        Ok(())
+    pub fn set_auto_challenge(mut self, value: bool) -> Self {
+        self.auto_challenge = value;
+        self
     }
 
     pub async fn query_resolved_input(&self, comm: Bytes) -> eyre::Result<Bytes> {
@@ -373,16 +460,24 @@ impl ChallengeManager {
         }
     }
 
-    async fn get_block_receipts(&self, block: H256) -> eyre::Result<Vec<TransactionReceipt>> {
+    async fn get_block_txs(&self, block: H256) -> eyre::Result<Vec<Transaction>> {
         let provider = self.contract.client();
         let block = provider
-            .get_block(block)
+            .get_block_with_txs(block)
             .await?
             .ok_or_else(|| eyre::eyre!("Block not found: {:?}", block))?;
+        Ok(block.transactions)
+    }
+
+    async fn get_block_receipts(
+        &self,
+        txs: Vec<Transaction>,
+    ) -> eyre::Result<Vec<TransactionReceipt>> {
+        let provider = self.contract.client();
         let mut receipts = Vec::new();
-        for tx in block.transactions {
+        for tx in txs {
             let receipt = provider
-                .get_transaction_receipt(tx)
+                .get_transaction_receipt(tx.hash)
                 .await?
                 .ok_or_else(|| eyre::eyre!("Transaction receipt not found"))?;
             receipts.push(receipt);
@@ -391,9 +486,32 @@ impl ChallengeManager {
     }
 
     pub async fn load_block(&self, block: H256) -> eyre::Result<()> {
-        let receipts = self.get_block_receipts(block).await?;
+        let txs = self.get_block_txs(block).await?;
+
+        if self.auto_challenge {
+            for tx in &txs {
+                if tx.to == Some(self.config.batch_inbox_address)
+                    && tx.from == self.system_config.batcher_addr
+                {
+                    if tx.block_number.is_none() || !self.is_valid_commitment(&tx.input) {
+                        tracing::error!("Skipping invalid tx data: {:?}", tx);
+                        continue;
+                    }
+                    let job = Job::new(
+                        JobType::Challenge,
+                        tx.block_number.unwrap().as_u64(),
+                        tx.input.0.slice(1..).into(),
+                    );
+                    tracing::debug!("Queing challenge job: {:?}", job);
+                    self.jobs.send(job).await?;
+                }
+            }
+        }
+
+        let receipts = self.get_block_receipts(txs).await?;
 
         for receipt in receipts {
+            let is_sender = self.is_sender(&receipt);
             if receipt.status == Some(1.into())
                 && receipt
                     .to
@@ -406,8 +524,10 @@ impl ChallengeManager {
                     if let Ok(event) = ChallengeStatusChangedFilter::decode_log(&raw) {
                         let status = ChallengeStatus::try_from(event.status)?;
                         self.record_challenge_status(status);
-                        if matches!(status, ChallengeStatus::Active) {
-                            let job = ResolveJob::new(
+                        // do not try to resolve if we are the challenger
+                        if matches!(status, ChallengeStatus::Active) && !is_sender {
+                            let job = Job::new(
+                                JobType::Resolve,
                                 event.challenged_block_number.as_u64(),
                                 event.challenged_commitment,
                             );
@@ -442,12 +562,18 @@ impl ChallengeManager {
                     if tx.to == Some(self.config.batch_inbox_address)
                         && tx.from == self.system_config.batcher_addr
                     {
+                        if !self.is_valid_commitment(&tx.input) {
+                            tracing::info!("skipping invalid commitment: {}", tx.input);
+                            continue;
+                        }
+                        // skip first tx data byte
+                        let comm: Bytes = tx.input.0.slice(1..).into();
                         let status = self
                             .contract
-                            .get_challenge_status(i.into(), tx.input.clone())
+                            .get_challenge_status(i.into(), comm.clone())
                             .await?;
                         if status == 1 {
-                            let job = ResolveJob::new(i, tx.input);
+                            let job = Job::new(JobType::Resolve, i, comm);
                             self.jobs.send(job).await?;
                         }
                     }
@@ -458,6 +584,23 @@ impl ChallengeManager {
         }
 
         Ok(())
+    }
+
+    fn is_sender(&self, receipt: &TransactionReceipt) -> bool {
+        receipt.from == self.contract.client().address()
+    }
+
+    fn is_valid_commitment(&self, comm: &Bytes) -> bool {
+        // validate txDataVersion1
+        if comm[0] != 1 {
+            return false;
+        }
+        // validate comm version 0
+        if comm[1] != 0 {
+            return false;
+        }
+        // 32 + 2 prefix bytes
+        comm.len() == 34
     }
 }
 
@@ -557,9 +700,13 @@ pub mod tests {
         pub async fn step(&mut self) -> eyre::Result<(Block<H256>, Bytes)> {
             // simulate batcher tx
             let (comm, _) = self.storage.put_random_input().await?;
+            // prefix with txdata version 1
+            let mut tx_data = vec![1];
+            tx_data.extend_from_slice(&comm);
+
             let tx = TransactionRequest::new()
                 .to(self.config.batch_inbox_address)
-                .data(comm.clone());
+                .data(Bytes::from(tx_data));
             let tx = self
                 .provider
                 .send_transaction(tx, None)
@@ -627,6 +774,25 @@ pub mod tests {
             }
             Ok(())
         }
+
+        pub async fn verify_challenged(&self) -> eyre::Result<()> {
+            for (bn, comm) in &self.commitments {
+                let status = self
+                    .dac
+                    .get_challenge_status((*bn).into(), comm.clone())
+                    .call()
+                    .await?;
+                if status != 1 {
+                    eyre::bail!(
+                        "commitment {} at block {} not challenged",
+                        hex::encode(&comm),
+                        bn
+                    );
+                }
+            }
+
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -670,14 +836,6 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_backfill() -> eyre::Result<()> {
-        // tracing_subscriber::registry()
-        //     .with(
-        //         tracing_subscriber::EnvFilter::try_from_default_env()
-        //             .unwrap_or_else(|_| "rpc=warn,sentinel=debug".into()),
-        //     )
-        //     .with(tracing_subscriber::fmt::layer())
-        //     .init();
-
         let mut harness = DacHarness::start().await?;
 
         let challenge_manager = ChallengeManager::new(
@@ -700,6 +858,56 @@ pub mod tests {
         challenge_manager.backfill(latest).await?;
 
         harness.verify_resolved().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_auto_challenge() -> eyre::Result<()> {
+        // tracing_subscriber::registry()
+        //     .with(
+        //         tracing_subscriber::EnvFilter::try_from_default_env()
+        //             .unwrap_or_else(|_| "rpc=warn,sentinel=debug".into()),
+        //     )
+        //     .with(tracing_subscriber::fmt::layer())
+        //     .init();
+
+        let mut harness = DacHarness::start().await?;
+
+        let wsp = Provider::<Ws>::connect(harness.anvil.ws_endpoint()).await?;
+
+        let mut stream = wsp.subscribe_blocks().await?.take(16);
+
+        let store = harness.storage.store.clone();
+        let remote = harness.storage.remote_storage.clone();
+
+        let storage_client =
+            StorageClient::new(store.clone(), Some(harness.storage.storage_address.clone()));
+
+        let challenge_manager = ChallengeManager::new(
+            store.clone(),
+            storage_client,
+            harness.new_resolver().await?,
+            harness.config.clone(),
+            None,
+        )
+        .set_auto_challenge(true);
+
+        for _ in 0..3 {
+            let (_, hash) = harness.step().await?;
+            // make sure we don't store anything so the challenger is forced to challenge
+            store.delete_preimage(hash.clone())?;
+            let key_string = format!("0x{}", hex::encode(hash));
+            remote.remove(key_string);
+        }
+
+        while let Some(block) = stream.next().await {
+            println!("{:?}", block.hash);
+
+            challenge_manager.load_block(block.hash.unwrap()).await?;
+        }
+
+        harness.verify_challenged().await?;
 
         Ok(())
     }
