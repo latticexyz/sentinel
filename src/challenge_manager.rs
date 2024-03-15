@@ -567,12 +567,13 @@ impl ChallengeManager {
                             continue;
                         }
                         // skip first tx data byte
+                        let comm: Bytes = tx.input.0.slice(1..).into();
                         let status = self
                             .contract
-                            .get_challenge_status(i.into(), tx.input.0.slice(1..).into())
+                            .get_challenge_status(i.into(), comm.clone())
                             .await?;
                         if status == 1 {
-                            let job = Job::new(JobType::Resolve, i, tx.input);
+                            let job = Job::new(JobType::Resolve, i, comm);
                             self.jobs.send(job).await?;
                         }
                     }
@@ -613,7 +614,7 @@ pub mod tests {
     use ethers::utils::hex;
     use std::sync::Arc;
     use std::time::Duration;
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    // use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     pub struct DacHarness {
         pub dac: Dac<Http>,
@@ -863,13 +864,13 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_auto_challenge() -> eyre::Result<()> {
-        tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "rpc=warn,sentinel=debug".into()),
-            )
-            .with(tracing_subscriber::fmt::layer())
-            .init();
+        // tracing_subscriber::registry()
+        //     .with(
+        //         tracing_subscriber::EnvFilter::try_from_default_env()
+        //             .unwrap_or_else(|_| "rpc=warn,sentinel=debug".into()),
+        //     )
+        //     .with(tracing_subscriber::fmt::layer())
+        //     .init();
 
         let mut harness = DacHarness::start().await?;
 
