@@ -44,6 +44,8 @@ pub struct Sentinel {
     server_port: u16,
     #[arg(long)]
     config: Option<String>,
+    #[arg(long, default_value = "false")]
+    challenge: bool,
 }
 
 impl Sentinel {
@@ -62,6 +64,7 @@ impl Sentinel {
             private_key,
             server_port: 8064,
             config: None,
+            challenge: false,
         }
     }
     pub async fn spawn(self) -> eyre::Result<SentinelHandle> {
@@ -99,7 +102,8 @@ impl Sentinel {
             dac,
             config,
             Some(metrics.clone()),
-        );
+        )
+        .set_auto_challenge(self.challenge);
 
         let addr = format!("0.0.0.0:{}", self.server_port);
 

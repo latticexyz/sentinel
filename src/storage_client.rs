@@ -98,6 +98,9 @@ pub mod tests {
             self.memstore.lock().unwrap().insert(key, value);
             Ok(())
         }
+        pub fn remove(&self, key: String) {
+            self.memstore.lock().unwrap().remove(&key);
+        }
     }
 
     impl Service<Request<Incoming>> for Storage {
@@ -178,6 +181,7 @@ pub mod tests {
 
     pub struct StorageHarness {
         pub store: Arc<Store>,
+        pub remote_storage: Storage,
         pub client: StorageClient,
         pub storage_server: tokio::task::JoinHandle<()>,
         pub storage_address: String,
@@ -192,8 +196,9 @@ pub mod tests {
             let listener = TcpListener::bind(addr).await.unwrap();
             let storage_addr = listener.local_addr().unwrap();
 
+            let s = storage.clone();
             let storage_server = tokio::spawn(async move {
-                serve_http(listener, storage).await.unwrap();
+                serve_http(listener, s).await.unwrap();
             });
 
             let dir = tempfile::tempdir().unwrap();
@@ -204,6 +209,7 @@ pub mod tests {
 
             Ok(Self {
                 store,
+                remote_storage: storage,
                 client: storage_client,
                 storage_server,
                 storage_address,
