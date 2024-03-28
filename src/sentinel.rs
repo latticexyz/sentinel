@@ -89,8 +89,7 @@ impl Sentinel {
 
         let client = Arc::new(provider.with_signer(wallet.clone().with_chain_id(ch_id.as_u64())));
 
-        let dac =
-            DataAvailabilityChallenge::new(config.da_challenge_contract_address, client.clone());
+        let dac = DataAvailabilityChallenge::new(config.da_challenge_address, client.clone());
 
         let mut registry = <Registry>::with_prefix("da_service");
 
