@@ -56,7 +56,10 @@ pub struct Config {
     // L1 address that declares the protocol versions, optional (Beta feature)
     pub protocol_versions_address: Option<Address>,
     // L1 Data Availability Challenge Contract Address
-    pub da_challenge_contract_address: Address,
+    pub da_challenge_address: Address,
+    pub da_challenge_window: u64,
+    pub da_resolve_window: u64,
+    pub use_plasma: bool,
 }
 
 impl Config {
@@ -67,7 +70,7 @@ impl Config {
     }
 
     pub fn with_challenge_contract(mut self, addr: Address) -> Self {
-        self.da_challenge_contract_address = addr;
+        self.da_challenge_address = addr;
         self
     }
 
